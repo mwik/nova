@@ -32,6 +32,8 @@
 -include_lib("nova/include/nova.hrl").
 
 -define(SERVER, ?MODULE).
+-define(NOVA_HANDLERS_TABLE, nova_handlers_table).
+
 
 -type nova_handler_callback() :: {Module :: atom(), Function :: atom()} |
                                  fun((...) -> any()).
@@ -42,9 +44,7 @@
 -export_type([handler_return/0]).
 
 
--record(state, {
-                handlers :: [{Handle :: atom(), Callback :: nova_handler_callback()}]
-               }).
+-record(state, {}).
 
 %%%===================================================================
 %%% API
@@ -71,7 +71,7 @@ start_link() ->
 -spec register_handler(Handle :: atom(), Callback :: nova_handler_callback()) ->
                               ok | {error, Reason :: atom()}.
 register_handler(Handle, Callback) ->
-    gen_server:cast(?SERVER, {register_handler, Handle, Callback}).
+    gen_server:call(?SERVER, {register_handler, Handle, Callback}).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -91,7 +91,11 @@ unregister_handler(Handle) ->
 -spec get_handler(Handle :: atom()) -> {ok, Callback :: nova_handler_callback()} |
                                        {error, Reason :: atom()}.
 get_handler(Handle) ->
-    gen_server:call(?SERVER, {get_handler, Handle}).
+    case ets:lookup(?NOVA_HANDLERS_TABLE, Handle) of
+        [] -> {error, not_found};
+        [Handler] -> {ok, Handler}
+    end.
+
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -110,12 +114,9 @@ get_handler(Handle) ->
                               ignore.
 init([]) ->
     process_flag(trap_exit, true),
-    register_handler(json, fun nova_basic_handler:handle_json/4),
-    register_handler(ok, fun nova_basic_handler:handle_ok/4),
-    register_handler(status, fun nova_basic_handler:handle_status/4),
-    register_handler(redirect, fun nova_basic_handler:handle_redirect/4),
-    register_handler(cowboy_req, fun nova_basic_handler:handle_cowboy_req/4),
-    {ok, #state{handlers = []}}.
+    ets:new(?NOVA_HANDLERS_TABLE, [named_table, protected]),
+    gen_server:cast(?SERVER, register_basic_handlers),
+    {ok, #state{}}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -132,22 +133,30 @@ init([]) ->
                          {noreply, NewState :: term(), hibernate} |
                          {stop, Reason :: term(), Reply :: term(), NewState :: term()} |
                          {stop, Reason :: term(), NewState :: term()}.
-handle_call({unregister_handler, Handle}, _From, State = #state{handlers = Handlers}) ->
-    case proplists:delete(Handle, Handlers) of
-        Handlers ->
+handle_call({unregister_handler, Handle}, _From, State) ->
+    case ets:lookup(?NOVA_HANDLERS_TABLE, Handle) of
+        [] ->
             ?WARNING("Error when unregistering handler: Could not find handler ~p", [Handle]),
             {reply, {error, not_found}, State};
-        Handlers0 ->
+        _ ->
+            ets:delete(?NOVA_HANDLERS_TABLE, Handle),
             ?DEBUG("Removed handler ~p", [Handle]),
-            {reply, ok, Handlers0}
+            {reply, ok, State}
     end;
-handle_call({get_handler, Handle}, _From, State = #state{handlers = Handlers}) ->
-    case proplists:get_value(Handle, Handlers) of
-        undefined ->
-            ?WARNING("Could not find handler ~p", [Handle]),
-            {reply, {error, not_found}, State};
-        Callback ->
-            {reply, {ok, Callback}, State}
+handle_call({register_handler, Handle, Callback}, _From, State) ->
+   Callback0 =
+        case Callback of
+            Callback when is_function(Callback) -> Callback;
+            {Module, Function} -> fun Module:Function/4
+        end,
+    case ets:lookup(?NOVA_HANDLERS_TABLE, Handle) of
+        [] ->
+            ets:insert(?NOVA_HANDLERS_TABLE, {Handle, Callback0}),
+            ?DEBUG("Registered handler '~p'", [Handle]),
+            {reply, ok, State};
+        _ ->
+            ?ERROR("Could not register handler ~p since there's already another one registered on that name", [Handle]),
+            {reply, {error, duplicate_entry}, State}
     end;
 handle_call(_Request, _From, State) ->
     Reply = ok,
@@ -164,20 +173,13 @@ handle_call(_Request, _From, State) ->
                          {noreply, NewState :: term(), Timeout :: timeout()} |
                          {noreply, NewState :: term(), hibernate} |
                          {stop, Reason :: term(), NewState :: term()}.
-handle_cast({register_handler, Handle, Callback}, State = #state{handlers = Handlers}) ->
-    Callback0 =
-        case Callback of
-            Callback when is_function(Callback) -> Callback;
-            {Module, Function} -> fun Module:Function/4
-        end,
-    case proplists:get_value(Handle, Handlers) of
-        undefined ->
-            ?DEBUG("Registered handler '~p'", [Handle]),
-            {noreply, State#state{handlers = [{Handle, Callback0}|Handlers]}};
-        _ ->
-            ?ERROR("Could not register handler ~p since there's already another one registered on that name", [Handle]),
-            {noreply, State}
-    end;
+handle_cast(register_basic_handlers, State) ->
+    ets:insert(?NOVA_HANDLERS_TABLE, {json, fun nova_basic_handler:handle_json/4}),
+    ets:insert(?NOVA_HANDLERS_TABLE, {ok, fun nova_basic_handler:handle_ok/4}),
+    ets:insert(?NOVA_HANDLERS_TABLE, {status, fun nova_basic_handler:handle_status/4}),
+    ets:insert(?NOVA_HANDLERS_TABLE, {redirect, fun nova_basic_handler:handle_redirect/4}),
+    ets:insert(?NOVA_HANDLERS_TABLE, {cowboy_req, fun nova_basic_handler:handle_cowboy_req/4}),
+    {noreply, State};
 handle_cast(_Request, State) ->
     {noreply, State}.
 
