@@ -41,7 +41,10 @@ init(Req, State) ->
     case run_pre_plugins(Req, State) of
         {ok, Req0, State0} ->
             %% Call the controller
-            {ok, StatusCode, Headers, Body, State1} = invoke_controller(Req0, State0),
+            {ok, StatusCode, Headers, Body, State1} = case Req0 of
+                                                          #{<<"methods">> := <<"OPTIONS">>} -> {ok, 200, #{}, #{}, State0};
+                                                          _ -> invoke_controller(Req0, State0)
+                                                      end,
             %% Invoke post_request plugins
             run_post_plugins(Req0, State1, {StatusCode, Headers, Body});
         {error, Req0} ->
